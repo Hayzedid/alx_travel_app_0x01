@@ -7,12 +7,14 @@ from django.db.models import Q
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 
-from .models import Listing, Booking, Review
+from .models import Listing, Booking, Review, Payment
 from .serializers import (
     ListingSerializer, ListingListSerializer,
     BookingSerializer, BookingListSerializer,
     ReviewSerializer
 )
+from .services.chapa_service import ChapaService
+from .services.email_service import EmailService
 
 
 class ListingViewSet(viewsets.ModelViewSet):
@@ -289,3 +291,300 @@ class ReviewViewSet(viewsets.ModelViewSet):
         reviews = self.queryset.filter(guest=request.user)
         serializer = self.get_serializer(reviews, many=True)
         return Response(serializer.data)
+
+
+class PaymentViewSet(viewsets.ViewSet):
+    """
+    ViewSet for handling payment operations with Chapa API
+    """
+    permission_classes = [IsAuthenticated]
+    
+    @swagger_auto_schema(
+        method='post',
+        operation_description="Initiate payment for a booking",
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            required=['booking_id', 'customer_data'],
+            properties={
+                'booking_id': openapi.Schema(type=openapi.TYPE_INTEGER, description='Booking ID'),
+                'customer_data': openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'first_name': openapi.Schema(type=openapi.TYPE_STRING),
+                        'last_name': openapi.Schema(type=openapi.TYPE_STRING),
+                        'email': openapi.Schema(type=openapi.TYPE_STRING),
+                        'phone': openapi.Schema(type=openapi.TYPE_STRING),
+                    }
+                ),
+                'return_url': openapi.Schema(type=openapi.TYPE_STRING, description='Return URL after payment'),
+            }
+        ),
+        responses={
+            200: openapi.Response(
+                description="Payment initiated successfully",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'success': openapi.Schema(type=openapi.TYPE_BOOLEAN),
+                        'checkout_url': openapi.Schema(type=openapi.TYPE_STRING),
+                        'payment_reference': openapi.Schema(type=openapi.TYPE_STRING),
+                        'message': openapi.Schema(type=openapi.TYPE_STRING),
+                    }
+                )
+            ),
+            400: openapi.Response(description="Bad request"),
+            404: openapi.Response(description="Booking not found"),
+        }
+    )
+    @action(detail=False, methods=['post'])
+    def initiate(self, request):
+        """Initiate payment for a booking"""
+        try:
+            booking_id = request.data.get('booking_id')
+            customer_data = request.data.get('customer_data', {})
+            return_url = request.data.get('return_url', 'https://alx-travel-app.com/payment/success')
+            
+            if not booking_id:
+                return Response(
+                    {'error': 'booking_id is required'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get booking
+            try:
+                booking = Booking.objects.get(id=booking_id, guest=request.user)
+            except Booking.DoesNotExist:
+                return Response(
+                    {'error': 'Booking not found or not owned by user'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Check if booking already has a successful payment
+            if hasattr(booking, 'payment') and booking.payment.is_successful:
+                return Response(
+                    {'error': 'Booking already paid'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Validate customer data
+            required_fields = ['first_name', 'last_name', 'email']
+            for field in required_fields:
+                if not customer_data.get(field):
+                    return Response(
+                        {'error': f'{field} is required in customer_data'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            
+            # Create callback URL
+            callback_url = request.build_absolute_uri('/api/payments/webhook/')
+            
+            # Initialize Chapa service and create payment
+            chapa_service = ChapaService()
+            result = chapa_service.create_payment_for_booking(
+                booking=booking,
+                customer_data=customer_data,
+                callback_url=callback_url,
+                return_url=return_url
+            )
+            
+            if result['success']:
+                return Response({
+                    'success': True,
+                    'checkout_url': result['checkout_url'],
+                    'payment_reference': str(result['payment'].payment_reference),
+                    'message': 'Payment initiated successfully'
+                })
+            else:
+                return Response(
+                    {'error': result['error']},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+        except Exception as e:
+            return Response(
+                {'error': f'Payment initiation failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @swagger_auto_schema(
+        method='get',
+        operation_description="Verify payment status",
+        manual_parameters=[
+            openapi.Parameter(
+                'payment_reference',
+                openapi.IN_QUERY,
+                description="Payment reference to verify",
+                type=openapi.TYPE_STRING,
+                required=True
+            )
+        ],
+        responses={
+            200: openapi.Response(
+                description="Payment verification result",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'success': openapi.Schema(type=openapi.TYPE_BOOLEAN),
+                        'status': openapi.Schema(type=openapi.TYPE_STRING),
+                        'message': openapi.Schema(type=openapi.TYPE_STRING),
+                        'payment_data': openapi.Schema(type=openapi.TYPE_OBJECT),
+                    }
+                )
+            ),
+            400: openapi.Response(description="Bad request"),
+            404: openapi.Response(description="Payment not found"),
+        }
+    )
+    @action(detail=False, methods=['get'])
+    def verify(self, request):
+        """Verify payment status"""
+        try:
+            payment_reference = request.query_params.get('payment_reference')
+            
+            if not payment_reference:
+                return Response(
+                    {'error': 'payment_reference is required'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get payment
+            try:
+                payment = Payment.objects.get(
+                    payment_reference=payment_reference,
+                    booking__guest=request.user
+                )
+            except Payment.DoesNotExist:
+                return Response(
+                    {'error': 'Payment not found or not owned by user'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Verify payment with Chapa
+            chapa_service = ChapaService()
+            result = chapa_service.process_payment_verification(payment)
+            
+            # Send confirmation email if payment completed
+            if result['success'] and result['status'] == 'completed':
+                EmailService.send_booking_confirmation_email(payment.booking, payment)
+            
+            return Response({
+                'success': result['success'],
+                'status': result['status'],
+                'message': result['message'],
+                'payment_data': {
+                    'payment_reference': str(payment.payment_reference),
+                    'amount': str(payment.amount),
+                    'currency': payment.currency,
+                    'status': payment.status,
+                    'created_at': payment.created_at,
+                    'paid_at': payment.paid_at,
+                }
+            })
+            
+        except Exception as e:
+            return Response(
+                {'error': f'Payment verification failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @swagger_auto_schema(
+        method='post',
+        operation_description="Chapa webhook endpoint for payment notifications",
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            description="Webhook payload from Chapa"
+        ),
+        responses={
+            200: openapi.Response(description="Webhook processed successfully"),
+            400: openapi.Response(description="Bad request"),
+        }
+    )
+    @action(detail=False, methods=['post'], permission_classes=[])
+    def webhook(self, request):
+        """Handle Chapa webhook notifications"""
+        try:
+            webhook_data = request.data
+            
+            # Initialize Chapa service and process webhook
+            chapa_service = ChapaService()
+            result = chapa_service.handle_webhook(webhook_data)
+            
+            if result['success']:
+                # If payment completed, send confirmation email
+                tx_ref = webhook_data.get('tx_ref')
+                if tx_ref and webhook_data.get('status') == 'success':
+                    try:
+                        payment = Payment.objects.get(payment_reference=tx_ref)
+                        EmailService.send_booking_confirmation_email(payment.booking, payment)
+                    except Payment.DoesNotExist:
+                        pass
+                
+                return Response({'message': result['message']})
+            else:
+                return Response(
+                    {'error': result['message']},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+        except Exception as e:
+            return Response(
+                {'error': f'Webhook processing failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @swagger_auto_schema(
+        method='get',
+        operation_description="Get user's payment history",
+        responses={
+            200: openapi.Response(
+                description="Payment history",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_ARRAY,
+                    items=openapi.Schema(
+                        type=openapi.TYPE_OBJECT,
+                        properties={
+                            'payment_reference': openapi.Schema(type=openapi.TYPE_STRING),
+                            'amount': openapi.Schema(type=openapi.TYPE_STRING),
+                            'currency': openapi.Schema(type=openapi.TYPE_STRING),
+                            'status': openapi.Schema(type=openapi.TYPE_STRING),
+                            'booking_id': openapi.Schema(type=openapi.TYPE_INTEGER),
+                            'listing_title': openapi.Schema(type=openapi.TYPE_STRING),
+                            'created_at': openapi.Schema(type=openapi.TYPE_STRING),
+                            'paid_at': openapi.Schema(type=openapi.TYPE_STRING),
+                        }
+                    )
+                )
+            )
+        }
+    )
+    @action(detail=False, methods=['get'])
+    def history(self, request):
+        """Get user's payment history"""
+        try:
+            payments = Payment.objects.filter(
+                booking__guest=request.user
+            ).select_related('booking', 'booking__listing').order_by('-created_at')
+            
+            payment_data = []
+            for payment in payments:
+                payment_data.append({
+                    'payment_reference': str(payment.payment_reference),
+                    'amount': str(payment.amount),
+                    'currency': payment.currency,
+                    'status': payment.status,
+                    'booking_id': payment.booking.id,
+                    'listing_title': payment.booking.listing.title,
+                    'listing_location': payment.booking.listing.location,
+                    'check_in_date': payment.booking.check_in_date,
+                    'check_out_date': payment.booking.check_out_date,
+                    'created_at': payment.created_at,
+                    'paid_at': payment.paid_at,
+                })
+            
+            return Response(payment_data)
+            
+        except Exception as e:
+            return Response(
+                {'error': f'Failed to retrieve payment history: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

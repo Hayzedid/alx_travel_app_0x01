@@ -7,6 +7,7 @@ router = DefaultRouter()
 router.register(r'listings', views.ListingViewSet, basename='listing')
 router.register(r'bookings', views.BookingViewSet, basename='booking')
 router.register(r'reviews', views.ReviewViewSet, basename='review')
+router.register(r'payments', views.PaymentViewSet, basename='payment')
 
 # The API URLs are now determined automatically by the router
 urlpatterns = [
@@ -47,3 +48,9 @@ urlpatterns = [
 # DELETE /api/reviews/{id}/                - Delete a specific review
 # GET    /api/reviews/by_listing/          - Get reviews for a specific listing
 # GET    /api/reviews/my_reviews/          - Get current user's reviews
+#
+# Payments:
+# POST   /api/payments/initiate/           - Initiate payment for a booking
+# GET    /api/payments/verify/             - Verify payment status
+# POST   /api/payments/webhook/            - Chapa webhook endpoint (no auth required)
+# GET    /api/payments/history/            - Get user's payment history
